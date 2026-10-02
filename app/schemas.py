@@ -272,6 +272,41 @@ class SessionComparisonRequest(BaseModel):
     right_expected_version: Annotated[int, Field(ge=0)]
 
 
+class MessageTrackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # Read-only tracking of one session's sends/receives at one named version;
+    # the session id itself travels in the path, like every other session
+    # endpoint that needs no body beyond the optimistic version.
+    expected_version: Annotated[int, Field(ge=0)]
+
+
+class MessageTrackRecord(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    # One send of the drill trace, paired with the later same-direction
+    # receive that consumes its one-slot queue message under FIFO order.
+    # Repeated sends of the same message stay separate records.
+    direction: Literal["A_to_B", "B_to_A"]
+    message: str
+    send_transition_id: str
+    send_step: int
+    # All three receive fields stay null together while the message is still
+    # in the one-slot queue (the send has not been received yet).
+    receive_transition_id: str | None = None
+    receive_step: int | None = None
+    # Trace steps strictly between the send and its receive, i.e.
+    # receive_step - send_step - 1 (excluding both endpoint steps).
+    interval_steps: int | None = None
+
+
+class MessageTrackResponse(BaseModel):
+    session_id: str
+    version: int
+    A_to_B: list[MessageTrackRecord]
+    B_to_A: list[MessageTrackRecord]
+
+
 class SessionView(BaseModel):
     id: str
     version: int

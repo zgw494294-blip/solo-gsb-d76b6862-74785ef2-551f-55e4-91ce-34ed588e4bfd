@@ -50,6 +50,15 @@ always belong to the same committed state: when either named expected version
 is stale the comparison answers 409 instead of mixing revisions; an unknown id
 answers 404.
 
+The message tracking endpoint traces every send of a single session's trace
+and pairs it with the later same-direction receive under the one-slot queue's
+FIFO discipline, listing sends that are still in the queue (never received).
+Like the comparison it is read-only and versioned: it replays the trace
+against that version's current protocol inside one read transaction, so it
+answers either the complete tracking at the named version or a 409 with the
+current version, never a cross-revision mix; an unknown session answers 404
+and a locked session can still be tracked.
+
 A session can be locked into a read-only baseline. Setting the lock flag is
 itself a versioned mutation: it carries an ``expected_version``, changes only
 the flag, advances the version by one and runs inside the same kind of
@@ -609,6 +618,103 @@ def _compare_directions(left: list[dict], right: list[dict]) -> dict:
 
 def _difference_view(position: int, left: dict | None, right: dict | None) -> dict:
     return {"position": position, "left": left, "right": right}
+
+
+def track_messages(session_id: str, expected_version: int) -> dict:
+    """Trace every message of one drill version and locate unreceived sends.
+
+    The stored trace is replayed against the session's own current protocol
+    (the replacement in effect at that version), and each send becomes one
+    record in its message direction (A→B or B→A) ordered by its trace step.
+    Under the one-slot queue semantics a direction carries at most one pending
+    message: later same-direction events are receives until that send is
+    consumed, after which the next send is enqueued. The records are therefore
+    the direction's sends in order, paired with the direction's receives in
+    order; a receive never belongs to a later send ahead of an earlier one.
+    Repeated sends of the same message stay separate records and are never
+    merged; sends still in the queue at the end of the trace keep all three
+    receive fields null.
+
+    The row is read inside one deferred (read-only) transaction, so in WAL
+    mode the version, protocol text and trace ids all come from the same
+    committed snapshot: the answer is either the complete tracking at the
+    named version or a 409 carrying current_version, never a mix of
+    revisions. Tracking does not write anything and consumes no version; a
+    locked session can be tracked just like any other read.
+    """
+    connection = _connect()
+    try:
+        connection.execute("BEGIN")
+        row = connection.execute(
+            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+
+        version, protocol_text, trace_text = row
+        if version != expected_version:
+            raise _version_conflict(version)
+
+        result = _track_directions(
+            DeadlockRequest.model_validate(json.loads(protocol_text)),
+            json.loads(trace_text),
+        )
+        return {"session_id": session_id, "version": version, **result}
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _track_directions(protocol, trace_ids: list[str]) -> dict[str, list[dict]]:
+    """Replay the trace under this protocol and pair sends with their receives.
+
+    One pending-send queue per direction models the one-slot channel: only a
+    send while the slot is empty can have a later receive, and that receive
+    closes the oldest (and only) pending send. The trace is one the session
+    already validated under this protocol, so every event respects that
+    discipline; replay only resolves each step's action, message and
+    direction. Pairing purely by FIFO order within a direction means two
+    sends of the same message still produce two distinct records.
+    """
+    model = build_model(protocol)
+    by_id = {transition.id: transition for transition in model.transitions}
+
+    pending: dict[str, list[dict]] = {"A_to_B": [], "B_to_A": []}
+    records: dict[str, list[dict]] = {"A_to_B": [], "B_to_A": []}
+
+    for index, transition_id in enumerate(trace_ids, start=1):
+        transition = by_id[transition_id]
+        direction = (
+            "A_to_B"
+            if (transition.sender, transition.receiver) == ("A", "B")
+            else "B_to_A"
+        )
+        if transition.action == "send":
+            record = {
+                "direction": direction,
+                "message": transition.message,
+                "send_transition_id": transition.id,
+                "send_step": index,
+                "receive_transition_id": None,
+                "receive_step": None,
+                "interval_steps": None,
+            }
+            records[direction].append(record)
+            pending[direction].append(record)
+        else:
+            # The one-slot FIFO queue hands this receive to the oldest still
+            # pending send of the direction; the interval excludes both the
+            # send and the receive step themselves.
+            sent = pending[direction].pop(0)
+            sent["receive_transition_id"] = transition.id
+            sent["receive_step"] = index
+            sent["interval_steps"] = index - sent["send_step"] - 1
+
+    return records
+
 
 
 def _comparison_conflict(current_version: int, side: str,
