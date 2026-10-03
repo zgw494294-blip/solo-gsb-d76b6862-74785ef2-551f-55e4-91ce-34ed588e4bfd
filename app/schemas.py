@@ -321,3 +321,35 @@ class SessionComparisonResponse(BaseModel):
     right_version: int
     A_to_B: DirectionComparison
     B_to_A: DirectionComparison
+
+
+class MessageTrackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # Read-only tracking of one session's drill trace at exactly this version:
+    # every send is paired with the later same-direction receive that consumes
+    # the one-slot queue, and unmatched sends locate the unreceived messages.
+    expected_version: Annotated[int, Field(ge=0)]
+
+
+class MessageRecord(BaseModel):
+    # One send in the trace, never merged with another send even when both use
+    # the same message name. A send the trace never consumed leaves the three
+    # receive columns null; steps_between counts trace steps strictly between
+    # the send and the receive (the two end steps themselves are excluded).
+    direction: Literal["A_to_B", "B_to_A"]
+    message: str
+    send_transition_id: str
+    send_step: int
+    receive_transition_id: str | None = None
+    receive_step: int | None = None
+    steps_between: int | None = None
+
+
+class MessageTrackResponse(BaseModel):
+    session_id: str
+    version: int
+    # Each direction is ordered by ascending send step; an empty trace yields
+    # two empty lists.
+    A_to_B: list[MessageRecord]
+    B_to_A: list[MessageRecord]

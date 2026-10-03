@@ -50,6 +50,16 @@ always belong to the same committed state: when either named expected version
 is stale the comparison answers 409 instead of mixing revisions; an unknown id
 answers 404.
 
+A single session's trace can also be tracked message by message. Walking the
+trace resolved against that session's current protocol, every send produces its
+own record (repeated sends of the same message name are never merged) and is
+paired with the following receive in the same message direction following the
+one-slot queue semantics; a send never consumed keeps its receive columns null,
+which is exactly how an unreceived message is located. Like the comparison, the
+track read is version pinned, writes nothing and answers 404 for an unknown id
+or 409 with the current version when the named version is stale; a locked
+session is tracked just as freely as it is queried.
+
 A session can be locked into a read-only baseline. Setting the lock flag is
 itself a versioned mutation: it carries an ``expected_version``, changes only
 the flag, advances the version by one and runs inside the same kind of
@@ -533,6 +543,107 @@ def compare_sessions(
         raise
     finally:
         connection.close()
+
+
+def track_session_messages(session_id: str, expected_version: int) -> dict:
+    """Track every sent message of one drill trace against its later receive.
+
+    The stored trace is resolved against the row's current protocol — the same
+    definitions the session was last validated under — and walked in trace
+    order. Every send creates its own record carrying its direction, message,
+    sending transition id and 1-based send step; repeated sends of the same
+    message name stay separate records. Under the one-slot queue semantics a
+    direction holds at most one message at a time, so each receive closes the
+    single still-open send in that direction (the receive exists in the trace
+    only because the head matched its message, so that pair carries the same
+    message). Sends never closed keep their receive columns null and are the
+    unreceived messages. Each record also reports the number of trace steps
+    strictly between its send and receive (excluding both steps). The two
+    directions are returned separately, already ordered by ascending send
+    step.
+
+    The row is read inside one read transaction, which in WAL mode observes a
+    single committed snapshot: the response is therefore either the complete
+    tracking result at exactly the named version or a 409 carrying the current
+    version, never a result mixed across revisions. The track writes nothing,
+    consumes no version and is allowed while the session is locked; an unknown
+    id answers 404.
+    """
+    connection = _connect()
+    try:
+        connection.execute("BEGIN")
+        row = connection.execute(
+            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        version, protocol_text, trace_text = row
+        if version != expected_version:
+            raise _version_conflict(version)
+
+        protocol = DeadlockRequest.model_validate(json.loads(protocol_text))
+        records = _message_records(protocol, json.loads(trace_text))
+
+        return {
+            "session_id": session_id,
+            "version": version,
+            "A_to_B": records["A_to_B"],
+            "B_to_A": records["B_to_A"],
+        }
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _message_records(protocol, trace_ids: list[str]) -> dict[str, list[dict]]:
+    """Pair every send of the trace with the receive that consumes its slot.
+
+    A trace the session validated under this protocol obeys the one-slot
+    semantics, so per direction the receives close the open sends in FIFO
+    order (in fact at most one send is open per direction at any moment).
+    Records are appended while walking the trace, which already orders them by
+    ascending send step; sends still open at the trace end are the unreceived
+    messages and keep their receive columns null.
+    """
+    model = build_model(protocol)
+    by_id = {transition.id: transition for transition in model.transitions}
+
+    open_sends: dict[str, dict] = {}
+    records: dict[str, list[dict]] = {"A_to_B": [], "B_to_A": []}
+
+    for index, transition_id in enumerate(trace_ids, start=1):
+        transition = by_id[transition_id]
+        direction = (
+            "A_to_B"
+            if (transition.sender, transition.receiver) == ("A", "B")
+            else "B_to_A"
+        )
+        if transition.action == "send":
+            record = {
+                "direction": direction,
+                "message": transition.message,
+                "send_transition_id": transition.id,
+                "send_step": index,
+                "receive_transition_id": None,
+                "receive_step": None,
+                "steps_between": None,
+            }
+            records[direction].append(record)
+            open_sends[direction] = record
+        else:
+            record = open_sends.get(direction)
+            # A validated trace never receives an empty/non-matching slot, so
+            # the pairing always exists; guard only against malformed storage.
+            if record is not None:
+                record["receive_transition_id"] = transition.id
+                record["receive_step"] = index
+                record["steps_between"] = index - record["send_step"] - 1
+                open_sends[direction] = None
+
+    return records
 
 
 def _direction_events(protocol, trace_ids: list[str]) -> dict[str, list[dict]]:

@@ -16,6 +16,8 @@ from .schemas import (
     ExecutionRequest,
     GuaranteeRequest,
     GuaranteeResponse,
+    MessageTrackRequest,
+    MessageTrackResponse,
     ProtocolReplaceRequest,
     SessionComparisonRequest,
     SessionComparisonResponse,
@@ -35,7 +37,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Offline Two-Party Message Protocol Deadlock Analyzer",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -126,3 +128,8 @@ def compare_session_traces(request: SessionComparisonRequest) -> dict:
         request.left_expected_version,
         request.right_expected_version,
     )
+
+
+@app.post("/v1/sessions/{session_id}/message-tracking", response_model=MessageTrackResponse)
+def track_session_message_exchange(session_id: str, request: MessageTrackRequest) -> dict:
+    return sessions.track_session_messages(session_id, request.expected_version)

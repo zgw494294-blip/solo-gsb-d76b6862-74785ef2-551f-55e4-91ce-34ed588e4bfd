@@ -574,7 +574,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 ## 双端协议演练会话
 
-除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。会话还可以被**锁定为只读基准**：锁定后执行、替换协议与作为接回目标均被拒绝，查询、对比、分支与作为接回来源不受影响，解锁后按新版本继续演练。
+除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。还可以沿轨迹**逐条追踪消息的发送与接收**：每次 send 单独成记录并与同方向后续 receive 配对，未接收的消息一目了然。会话还可以被**锁定为只读基准**：锁定后执行、替换协议与作为接回目标均被拒绝，查询、对比、追踪、分支与作为接回来源不受影响，解锁后按新版本继续演练。
 
 - 会话（协议、轨迹 ID、版本、锁定标记）持久化在**本地 SQLite 数据库**中，所有进程共享同一文件：服务或容器重建后仍可按原会话 ID 查询并继续执行、替换协议，版本不会回退。
 - 服务默认以 **2 个 Uvicorn worker** 进程运行，启动时自动建库建表（无需迁移旧数据）；旧版数据库启动时自动补充锁定列，已有协议、轨迹与版本保持不变，旧会话默认未锁定。
@@ -594,6 +594,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `POST` | `/v1/sessions/{id}/branches` | 从指定轨迹位置另开分支会话，请求体 `{"expected_version": ..., "prefix_length": ...}`，返回新会话视图（版本 0） |
 | `POST` | `/v1/sessions/{id}/adoptions` | 把来源会话的后续轨迹接回本目标会话，请求体 `{"source_session_id": ..., "target_expected_version": ..., "source_expected_version": ...}` |
 | `POST` | `/v1/session-comparisons` | 按消息方向对比两次演练（只读、不改数据与版本），请求体 `{"left_session_id": ..., "right_session_id": ..., "left_expected_version": ..., "right_expected_version": ...}` |
+| `POST` | `/v1/sessions/{id}/message-tracking` | 沿轨迹逐条追踪消息的发送与接收（只读、不改数据与版本，锁定会话也可查询），请求体 `{"expected_version": ...}` |
 
 响应均为同一会话视图：
 
@@ -1187,6 +1188,198 @@ curl -s http://localhost:8000/v1/sessions/$EMPTY \
 ```
 
 与来源会话自身的修改并发时，每个接回要么读到来源指定版本的完整快照（接纳其全部剩余轨迹），要么以 `session: "source"` 返回 `409`，响应绝不会混入来源随后提交的步骤。
+
+### 消息发送/接收追踪：`POST /v1/sessions/{id}/message-tracking`
+
+沿一条演练轨迹**逐条追踪每条消息的发送与接收**，定位尚未收到的消息：
+
+- 请求体只给出版本：`{"expected_version": ...}`。服务按该会话该版本的**当前协议**解析完整轨迹（协议曾被替换时按替换后的定义计算），按轨迹原顺序行走。
+- 每次 `send` 都生成**一条独立记录**，即使同名消息被重复发送也**绝不合并**。记录字段：
+  - `direction`：消息方向，`"A_to_B"` 或 `"B_to_A"`；
+  - `message`：消息类型（取当前协议定义）；
+  - `send_transition_id`、`send_step`：发送转移 ID 与**从 1 计**的发送步号；
+  - 按现有**一格队列**规则，与该 send 同方向的后续 `receive` 消费其唯一在槽消息，补上 `receive_transition_id`、`receive_step`（接收转移 ID 与从 1 计的步号）以及 `steps_between`：**不含发送、接收这两步本身**的中间间隔步数（相邻两步为 `0`）；
+  - 轨迹走完仍未被接收的 send（即尚未收到的消息）这三项为 `null`。
+- 响应按方向分别给出 `A_to_B`、`B_to_A` 两个列表，各自按发送步号升序；**空轨迹返回两份空列表**。
+- 响应回显 `session_id` 与所用 `version`。接口**只读**：不改数据、不消耗版本，**锁定会话也可查询**。
+- 状态码：成功 `200`；未知会话 `404`（`{"detail": "unknown session"}`）；`expected_version` 过期返回 `409` 及 `current_version`；请求体不合法（缺失/负数版本、多余字段等，规则同其他会话接口）返回 `422`。
+- 会话行在一个读事务内读取（WAL 下整个事务只观察同一份已提交快照）：并发修改期间，追踪要么返回**指定版本的完整结果**，要么返回 `409`，绝不会混入随后提交的轨迹步骤。
+
+#### 可执行示例：已接收、未接收与重复消息（端口 8000）
+
+下面的协议两个方向都可以发送/接收，且发送转移在状态 `0` 自环，因此「先 A→B 还是先 B→A」都合法。
+
+```bash
+TRACK='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "sAB", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 0 },
+    { "id": "rAB", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 },
+    { "id": "sBA", "from": "B", "to": "A", "action": "send",    "message": "n", "source": 0, "target": 0 },
+    { "id": "rBA", "from": "B", "to": "A", "action": "receive", "message": "n", "source": 0, "target": 1 }
+  ]
+}'
+TID=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$TRACK" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+```
+
+空轨迹返回两份空列表：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/sessions/$TID/message-tracking \
+  -H 'Content-Type: application/json' -d '{"expected_version": 0}'
+# {"session_id":"…","version":0,"A_to_B":[],"B_to_A":[]}
+```
+
+走 `sAB`（A→B 发送 `m`，尚未接收，版本 `1`），追踪结果中接收三项为 `null`：
+
+```bash
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$TID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"sAB","expected_version":0}'
+curl -s -X POST http://localhost:8000/v1/sessions/$TID/message-tracking \
+  -H 'Content-Type: application/json' -d '{"expected_version": 1}'
+```
+
+```json
+{
+  "session_id": "…",
+  "version": 1,
+  "A_to_B": [
+    {
+      "direction": "A_to_B",
+      "message": "m",
+      "send_transition_id": "sAB",
+      "send_step": 1,
+      "receive_transition_id": null,
+      "receive_step": null,
+      "steps_between": null
+    }
+  ],
+  "B_to_A": []
+}
+```
+
+再走 `sBA, rAB, rBA`（两个方向交错，版本 `4`）：每条 send 与同方向后续 receive 配对，`steps_between` 只数收发两步之间的步骤，跨方向的那一步计入间隔：
+
+```bash
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$TID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"sBA","expected_version":1}'
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$TID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"rAB","expected_version":2}'
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$TID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"rBA","expected_version":3}'
+curl -s -X POST http://localhost:8000/v1/sessions/$TID/message-tracking \
+  -H 'Content-Type: application/json' -d '{"expected_version": 4}'
+```
+
+```json
+{
+  "session_id": "…",
+  "version": 4,
+  "A_to_B": [
+    {
+      "direction": "A_to_B",
+      "message": "m",
+      "send_transition_id": "sAB",
+      "send_step": 1,
+      "receive_transition_id": "rAB",
+      "receive_step": 3,
+      "steps_between": 1
+    }
+  ],
+  "B_to_A": [
+    {
+      "direction": "B_to_A",
+      "message": "n",
+      "send_transition_id": "sBA",
+      "send_step": 2,
+      "receive_transition_id": "rBA",
+      "receive_step": 4,
+      "steps_between": 1
+    }
+  ]
+}
+```
+
+同名消息 `m` 发送两次时生成**两条独立记录、不合并**（下例轨迹 `s1, r1, s2, r2`；第二条尚未接收时其接收三项为 `null`）：
+
+```bash
+REPEAT='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "s1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 0 },
+    { "id": "r1", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 },
+    { "id": "s2", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 0 },
+    { "id": "r2", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 1, "target": 1 }
+  ]
+}'
+RID=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$REPEAT" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+for body in '{"transition_id":"s1","expected_version":0}' \
+            '{"transition_id":"r1","expected_version":1}' \
+            '{"transition_id":"s2","expected_version":2}'; do
+  curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$RID/transitions \
+    -H 'Content-Type: application/json' -d "$body"
+done
+curl -s -X POST http://localhost:8000/v1/sessions/$RID/message-tracking \
+  -H 'Content-Type: application/json' -d '{"expected_version": 3}'
+```
+
+```json
+{
+  "session_id": "…",
+  "version": 3,
+  "A_to_B": [
+    {
+      "direction": "A_to_B",
+      "message": "m",
+      "send_transition_id": "s1",
+      "send_step": 1,
+      "receive_transition_id": "r1",
+      "receive_step": 2,
+      "steps_between": 0
+    },
+    {
+      "direction": "A_to_B",
+      "message": "m",
+      "send_transition_id": "s2",
+      "send_step": 3,
+      "receive_transition_id": null,
+      "receive_step": null,
+      "steps_between": null
+    }
+  ],
+  "B_to_A": []
+}
+```
+
+协议替换后追踪按**新定义**计算：例如把发送消息改名后成功重放，记录中的 `message` 即为新名；若替换本身因重放失败被拒（`422`），会话保持旧版本，追踪依旧只反映已提交的旧协议。
+
+锁定会话与错误码：
+
+```bash
+# 锁定后仍可追踪（只读）
+curl -s -o /dev/null -X PUT http://localhost:8000/v1/sessions/$TID/lock \
+  -H 'Content-Type: application/json' -d '{"expected_version": 4, "locked": true}'
+curl -s -i -X POST http://localhost:8000/v1/sessions/$TID/message-tracking \
+  -H 'Content-Type: application/json' -d '{"expected_version": 5}'
+# HTTP/1.1 200 OK  ->  完整追踪结果；会话版本与锁定标记均不变
+
+# 版本过期 -> 409 并含 current_version
+curl -s -i -X POST http://localhost:8000/v1/sessions/$TID/message-tracking \
+  -H 'Content-Type: application/json' -d '{"expected_version": 0}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"error":"version_conflict","current_version":5}}
+
+# 未知会话 -> 404
+curl -s -i -X POST http://localhost:8000/v1/sessions/does-not-exist/message-tracking \
+  -H 'Content-Type: application/json' -d '{"expected_version": 0}'
+# HTTP/1.1 404 Not Found  ->  {"detail":"unknown session"}
+```
+
+追踪不写任何数据：调用后用 `GET /v1/sessions/{id}` 复核，版本、轨迹与锁定标记均不变。并发场景下（2 个 worker），追踪与执行/替换/接回同时进行时，每个追踪要么返回指定版本的完整结果，要么返回 `409`，不会返回跨版本拼凑的结果。
 
 ### 存储位置与卷保留规则
 
